@@ -16,7 +16,8 @@
 (defonce ^:private in-dispatch (ThreadLocal.))
 
 (defonce executor
-  (delay (tp/thread-pool-executor #(.set ^ThreadLocal in-dispatch true))))
+  (delay (java.util.concurrent.Executors/newVirtualThreadPerTaskExecutor)
+         #_(tp/thread-pool-executor #(.set ^ThreadLocal in-dispatch true))))
 
 (defn in-dispatch-thread?
   "Returns true if the current thread is a go block dispatch pool thread"
@@ -32,4 +33,4 @@
 (defn run
   "Runs Runnable r in a thread pool thread"
   [^Runnable r]
-  (impl/exec @executor r))
+  (.execute ^java.util.concurrent.Executor @executor r))

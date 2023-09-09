@@ -26,12 +26,12 @@ to catch and handle."
             [clojure.core.async.impl.buffers :as buffers]
             [clojure.core.async.impl.timers :as timers]
             [clojure.core.async.impl.dispatch :as dispatch]
-            [clojure.core.async.impl.ioc-macros :as ioc]
+;            [clojure.core.async.impl.ioc-macros :as ioc]
             [clojure.core.async.impl.mutex :as mutex]
             [clojure.core.async.impl.concurrent :as conc]
             )
   (:import [java.util.concurrent.atomic AtomicLong]
-           [java.util.concurrent.locks Lock]
+           [java.util.concurrent.locks Lock LockSupport]
            [java.util.concurrent Executors Executor ThreadLocalRandom]
            [java.util Arrays ArrayList]
            [clojure.lang Var]))
@@ -113,6 +113,14 @@ to catch and handle."
   [^long msecs]
   (timers/timeout msecs))
 
+(defmacro ^:private park
+  [ref blocker]
+  `(loop []
+     (let [val# (deref ~ref)]
+      (if (identical? val# ::nada)
+        (do (LockSupport/park ~blocker) (recur))
+        val#))))
+
 (defmacro defblockingop
   [op doc arglist & body]
   (let [as (mapv #(list 'quote %) arglist)]
@@ -124,24 +132,26 @@ to catch and handle."
          (fn ~arglist
            ~@body)))))
 
-(defblockingop <!!
+(defn <!!
   "takes a val from port. Will return nil if closed. Will block
   if nothing is available.
   Not intended for use in direct or transitive calls from (go ...) blocks.
   Use the clojure.core.async.go-checking flag to detect invalid use (see
   namespace docs)."
   [port]
-  (let [p (promise)
-        ret (impl/take! port (fn-handler (fn [v] (deliver p v))))]
+  (let [box (volatile! ::nada)
+        t (Thread/currentThread)
+        ret (impl/take! port (fn-handler #(do (vreset! box %)
+                                              (LockSupport/unpark t))))]
     (if ret
       @ret
-      (deref p))))
+      (park box port))))
 
 (defn <!
   "takes a val from port. Must be called inside a (go ...) block. Will
   return nil if closed. Will park if nothing is available."
   [port]
-  (assert nil "<! used not in (go ...) block"))
+  (<!! port))
 
 (defn take!
   "Asynchronously takes a val from port, passing to fn1. Will pass nil
@@ -163,25 +173,27 @@ to catch and handle."
              (dispatch/run #(fn1 val)))))
        nil)))
 
-(defblockingop >!!
+(defn >!!
   "puts a val into port. nil values are not allowed. Will block if no
   buffer space is available. Returns true unless port is already closed.
   Not intended for use in direct or transitive calls from (go ...) blocks.
   Use the clojure.core.async.go-checking flag to detect invalid use (see
   namespace docs)."
   [port val]
-  (let [p (promise)
-        ret (impl/put! port val (fn-handler (fn [open?] (deliver p open?))))]
+  (let [box (volatile! ::nada)
+        t (Thread/currentThread)
+        ret (impl/put! port val (fn-handler #(do (vreset! box %)
+                                                 (LockSupport/unpark t))))]
     (if ret
       @ret
-      (deref p))))
+      (park box port))))
 
 (defn >!
   "puts a val into port. nil values are not allowed. Must be called
   inside a (go ...) block. Will park if no buffer space is available.
   Returns true unless port is already closed."
   [port val]
-  (assert nil ">! used not in (go ...) block"))
+  (>!! port val))
 
 (defn- nop [_])
 (def ^:private fhnop (fn-handler nop))
@@ -300,18 +312,19 @@ to catch and handle."
          (when got
            (channels/box [(:default opts) :default])))))))
 
-(defblockingop alts!!
+(defn alts!!
   "Like alts!, except takes will be made as if by <!!, and puts will
   be made as if by >!!, will block until completed.
   Not intended for use in direct or transitive calls from (go ...) blocks.
   Use the clojure.core.async.go-checking flag to detect invalid use (see
   namespace docs)."
   [ports & opts]
-  (let [p (promise)
-        ret (do-alts (partial deliver p) ports (apply hash-map opts))]
+  (let [box (volatile! ::nada)
+        t (Thread/currentThread)
+        ret (do-alts #(do (vreset! box %) (LockSupport/unpark t)) ports (apply hash-map opts))]
     (if ret
       @ret
-      (deref p))))
+      (park box ::alts))))
 
 (defn alts!
   "Completes at most one of several channel operations. Must be called
@@ -336,8 +349,8 @@ to catch and handle."
   used, nor in what order should they be, so they should not be
   depended upon for side effects."
 
-  [ports & {:as opts}]
-  (assert nil "alts! used not in (go ...) block"))
+  [ports & opts]
+  (apply alts!! ports opts))
 
 (defn do-alt [alts clauses]
   (assert (even? (count clauses)) "unbalanced clauses")
@@ -415,7 +428,7 @@ to catch and handle."
   [& clauses]
   (do-alt `alts! clauses))
 
-(defn ioc-alts! [state cont-block ports & {:as opts}]
+#_(defn ioc-alts! [state cont-block ports & {:as opts}]
   (ioc/aset-all! state ioc/STATE-IDX cont-block)
   (when-let [cb (clojure.core.async/do-alts
                   (fn [val]
@@ -456,18 +469,15 @@ to catch and handle."
   Returns a channel which will receive the result of the body when
   completed"
   [& body]
-  (let [crossing-env (zipmap (keys &env) (repeatedly gensym))]
-    `(let [c# (chan 1)
-           captured-bindings# (Var/getThreadBindingFrame)]
-       (dispatch/run
-         (^:once fn* []
-          (let [~@(mapcat (fn [[l sym]] [sym `(^:once fn* [] ~(vary-meta l dissoc :tag))]) crossing-env)
-                f# ~(ioc/state-machine `(do ~@body) 1 [crossing-env &env] ioc/async-custom-terminators)
-                state# (-> (f#)
-                           (ioc/aset-all! ioc/USER-START-IDX c#
-                                          ioc/BINDINGS-IDX captured-bindings#))]
-            (ioc/run-state-machine-wrapped state#))))
-       c#)))
+  `(let [c# (chan 1)
+       #_#_  captured-bindings# (Var/getThreadBindingFrame)]
+     (dispatch/run
+       (^:once fn* []
+        (try
+          (when-some [ret# (do ~@body)]
+            (>!! c# ret#))
+          (finally (close! c#)))))
+     c#))
 
 (defonce ^:private ^Executor thread-macro-executor
   (Executors/newCachedThreadPool (conc/counted-thread-factory "async-thread-macro-%d" true)))
